@@ -1,0 +1,26 @@
+---
+dependency:
+  name: galaxy
+driver:
+  name: default
+  libvirt_uri: "qemu:///system"
+  cache_dir: "~/.cache/molecule/images"
+  vm_username: ubuntu
+  options:
+    managed: true
+platforms:
+  - name: ubuntu-test-1
+    base_image: "https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img"
+    memory_mb: 2048
+    cpus: 2
+    disk_size: 10G
+    networks:
+      - name: mgmt
+        interfaces:
+          - { name: "enp0s3", ip: "10.200.42.10/24", primary: true}
+
+provisioner:
+  name: ansible
+  log: true
+verifier:
+  name: testinfra

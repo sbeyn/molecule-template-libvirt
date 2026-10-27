@@ -1,0 +1,86 @@
+---
+- name: Destroy Isolated Libvirt Environment
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  no_log: "{{ not (lookup('env', 'MOLECULE_DEBUG') | bool or molecule_yml.provisioner.log | default(false) | bool) }}"
+  vars:
+    molecule_run_id: "{{ lookup('env', 'MOLECULE_RUN_ID') | default(lookup('env', 'MOLECULE_EPHEMERAL_DIRECTORY') | hash('md5') | truncate(8, True, ''), True) }}"
+    run_pool_name: "mol-pool-{{ molecule_run_id }}"
+    run_pool_dir: "/var/tmp/molecule/pools/{{ run_pool_name }}"
+
+  tasks:
+
+    - name: Force stop (poweroff) all Libvirt VMs
+      community.libvirt.virt:
+        uri: "{{ molecule_yml.driver.libvirt_uri }}"
+        name: "{{ item.name }}-{{ molecule_run_id }}"
+        state: destroyed
+        force: true
+      loop: "{{ molecule_yml.platforms }}"
+      failed_when: false
+
+    - name: Wait until all Libvirt VMs are completely stopped
+      community.libvirt.virt:
+        uri: "{{ molecule_yml.driver.libvirt_uri }}"
+        name: "{{ item.name }}-{{ molecule_run_id }}"
+        command: status
+      register: vm_status
+      until: vm_status.status in ['shutdown', 'shut off', 'crashed']
+      retries: 15
+      delay: 2
+      loop: "{{ molecule_yml.platforms }}"
+      failed_when: false
+
+    - name: Undefine all stopped Libvirt VMs
+      community.libvirt.virt:
+        uri: "{{ molecule_yml.driver.libvirt_uri }}"
+        name: "{{ item.item.name }}-{{ molecule_run_id }}"
+        command: undefine
+      loop: "{{ vm_status.results }}"
+      when: item.status is defined and item.status in ['shutdown', 'shut off', 'crashed']
+      failed_when: false
+
+
+    - name: Extract unique network names
+      ansible.builtin.set_fact:
+        all_networks: "{{ (all_networks | default([])) + [item.1.name] }}"
+      loop: "{{ query('subelements', molecule_yml.platforms, 'networks', {'skip_missing': True}) }}"
+      when: item.1.name != 'default'
+
+    - name: Deduplicate network names
+      ansible.builtin.set_fact:
+        all_networks: "{{ all_networks | default([]) | unique }}"
+
+    - name: Destroy and undefine isolated Libvirt networks
+      community.libvirt.virt_net:
+        uri: "{{ molecule_yml.driver.libvirt_uri }}"
+        name: "mol-net-{{ item }}-{{ molecule_run_id }}"
+        state: absent
+        command: undefine
+      loop: "{{ all_networks | default([]) }}"
+      failed_when: false
+
+    - name: Stop Libvirt run Storage Pool
+      community.libvirt.virt_pool:
+        uri: "{{ molecule_yml.driver.libvirt_uri }}"
+        name: "{{ run_pool_name }}"
+        state: inactive
+      failed_when: false
+
+    - name: Undefine Libvirt run Storage Pool
+      community.libvirt.virt_pool:
+        uri: "{{ molecule_yml.driver.libvirt_uri }}"
+        name: "{{ run_pool_name }}"
+        command: undefine
+      failed_when: false
+
+    - name: Delete run Storage Pool directory on filesystem
+      ansible.builtin.file:
+        path: "{{ run_pool_dir }}"
+        state: absent
+
+    - name: Remove molecule instance config
+      ansible.builtin.file:
+        path: "{{ molecule_instance_config }}"
+        state: absent

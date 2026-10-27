@@ -1,0 +1,43 @@
+<domain type='kvm'>
+  <name>{{ item.name }}-{{ molecule_run_id }}</name>
+  <memory unit='MiB'>{{ item.memory_mb }}</memory>
+  <vcpu placement='static'>{{ item.cpus }}</vcpu>
+  
+  <metadata>
+    <molecule:group xmlns:molecule="http://molecule.ansible.com/xmlns/1.0">{{ molecule_run_id }}</molecule:group>
+  </metadata>
+
+  <os>
+    <type arch='x86_64' machine='pc'>hvm</type>
+    <boot dev='hd'/>
+  </os>
+  <devices>
+    <emulator>/usr/bin/qemu-system-x86_64</emulator>
+    
+    <!-- Disque principal OS (COW) -->
+    <disk type='volume' device='disk'>
+      <driver name='qemu' type='qcow2'/>
+      <source pool='mol-pool-{{ molecule_run_id }}' volume='{{ item.name }}-{{ molecule_run_id }}.qcow2'/>
+      <target dev='vda' bus='virtio'/>
+    </disk>
+
+    <!-- ISO Cloud-Init NoCloud -->
+    <disk type='volume' device='cdrom'>
+      <driver name='qemu' type='raw'/>
+      <source pool='mol-pool-{{ molecule_run_id }}' volume='{{ item.name }}-{{ molecule_run_id }}-cloud-init.iso'/>
+      <target dev='sda' bus='sata'/>
+      <readonly/>
+    </disk>
+
+    {% for net in item.networks | default([{'name': 'default'}]) %}
+    {% set net_ref = net.name if net.name == 'default' else 'mol-net-' + net.name + '-' + molecule_run_id %}
+    <interface type='network'>
+      <source network='{{ net_ref }}'/>
+      <model type='virtio'/>
+    </interface>
+    {% endfor %}
+
+    <graphics type='vnc' port='-1' autoport='yes' listen='127.0.0.1'/>
+    <console type='pty'/>
+  </devices>
+</domain>

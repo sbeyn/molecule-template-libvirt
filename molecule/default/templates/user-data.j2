@@ -1,0 +1,26 @@
+#cloud-config
+hostname: {{ platform.name }}
+manage_etc_hosts: true
+ssh_pwauth: true
+
+users:
+  - name: {{ molecule_yml.driver.vm_username | default('ubuntu') }}
+    sudo: "ALL=(ALL) NOPASSWD:ALL"
+    groups: users, sudo
+    shell: /bin/bash
+    lock_passwd: true
+    type: text
+    ssh_authorized_keys:
+      - {{ ssh_pub_key }}
+
+packages:
+  - qemu-guest-agent
+  - python3
+
+runcmd:
+  - swapoff -a
+  - sed -i '/swap/d' /etc/fstab
+  - systemctl enable --now qemu-guest-agent
+
+timezone: UTC
+final_message: "{{ platform.name }} is ready!"

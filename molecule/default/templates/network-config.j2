@@ -1,0 +1,28 @@
+version: 2
+ethernets:
+{% for net in platform.networks | default([]) %}
+{% if net.name != 'default' and net.interfaces is defined %}
+{% for iface in net.interfaces %}
+  {{ iface.name }}:
+{% if iface.ip is defined %}
+{% set net_cidr = iface.ip %}
+{% set net_addr = net_cidr | ansible.utils.ipaddr('network') %}
+{% set gateway = net_addr | ansible.utils.ipmath(1) %}
+    dhcp4: false
+    addresses:
+      - "{{ net_cidr }}"
+{% if iface.primary | default(false) %}
+    routes:
+      - to: default
+        via: "{{ gateway }}"
+    nameservers:
+      addresses:
+        - "{{ gateway }}"
+        - 8.8.8.8
+{% endif %}
+{% else %}
+    dhcp4: true
+{% endif %}
+{% endfor %}
+{% endif %}
+{% endfor %}

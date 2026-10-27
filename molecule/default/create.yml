@@ -1,0 +1,314 @@
+---
+- name: Create Isolated Libvirt Environment with Cloud-Init
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  no_log: "{{ not (lookup('env', 'MOLECULE_DEBUG') | bool or molecule_yml.provisioner.log | default(false) | bool) }}"
+  vars:
+    molecule_run_id: "{{ lookup('env', 'MOLECULE_RUN_ID') | default(lookup('env', 'MOLECULE_EPHEMERAL_DIRECTORY') | hash('md5') | truncate(8, True, ''), True) }}"
+    ephemeral_dir: "{{ lookup('env', 'MOLECULE_EPHEMERAL_DIRECTORY') }}"
+    keypair_path: "{{ ephemeral_dir }}/ssh_key"
+    
+    # Pool d'images global et permanent
+    base_pool_name: "molecule"
+    base_pool_dir: "/var/tmp/molecule/base-images"
+
+    # Pool éphémère du run en cours
+    run_pool_name: "mol-pool-{{ molecule_run_id }}"
+    run_pool_dir: "/var/tmp/molecule/pools/{{ run_pool_name }}"
+
+  tasks:
+    - name: Generate ephemeral SSH Keypair
+      community.crypto.openssh_keypair:
+        path: "{{ keypair_path }}"
+        type: ed25519
+      register: ssh_key_result
+
+    - name: Ensure base image pool directory exists
+      ansible.builtin.file:
+        path: "{{ base_pool_dir }}"
+        state: directory
+        mode: '0777'
+
+    - name: Define permanent "molecule" Storage Pool
+      community.libvirt.virt_pool:
+        uri: "{{ molecule_yml.driver.libvirt_uri }}"
+        command: define
+        name: "{{ base_pool_name }}"
+        xml: |
+          <pool type='dir'>
+            <name>{{ base_pool_name }}</name>
+            <target>
+              <path>{{ base_pool_dir }}</path>
+            </target>
+          </pool>
+
+    - name: Ensure "molecule" Storage Pool is active
+      community.libvirt.virt_pool:
+        uri: "{{ molecule_yml.driver.libvirt_uri }}"
+        name: "{{ base_pool_name }}"
+        state: active
+
+    - name: Download base Cloud Image to "molecule" pool if not present
+      ansible.builtin.get_url:
+        url: "{{ item.base_image }}"
+        dest: "{{ base_pool_dir }}/{{ item.base_image | basename }}"
+        mode: '0666'
+      loop: "{{ molecule_yml.platforms }}"
+
+    - name: Refresh "molecule" Storage Pool
+      community.libvirt.virt_pool:
+        uri: "{{ molecule_yml.driver.libvirt_uri }}"
+        name: "{{ base_pool_name }}"
+        command: refresh
+
+    - name: Ensure run Storage Pool target directory exists
+      ansible.builtin.file:
+        path: "{{ run_pool_dir }}"
+        state: directory
+        mode: '0777'
+
+    - name: Define run Libvirt Storage Pool
+      community.libvirt.virt_pool:
+        uri: "{{ molecule_yml.driver.libvirt_uri }}"
+        command: define
+        name: "{{ run_pool_name }}"
+        xml: |
+          <pool type='dir'>
+            <name>{{ run_pool_name }}</name>
+            <target>
+              <path>{{ run_pool_dir }}</path>
+            </target>
+          </pool>
+
+    - name: Ensure run Storage Pool is active
+      community.libvirt.virt_pool:
+        uri: "{{ molecule_yml.driver.libvirt_uri }}"
+        name: "{{ run_pool_name }}"
+        state: active
+
+    - name: Create COW disk volume
+      ansible.builtin.command: >
+        qemu-img create -f qcow2 -b {{ base_pool_dir }}/{{ item.base_image | basename }}
+        -F qcow2 {{ run_pool_dir }}/{{ item.name }}-{{ molecule_run_id }}.qcow2 {{ item.disk_size | default('10G') }}
+      args:
+        creates: "{{ run_pool_dir }}/{{ item.name }}-{{ molecule_run_id }}.qcow2"
+      loop: "{{ molecule_yml.platforms }}"
+
+    - name: Ensure per-platform cloud-init build directory exists
+      ansible.builtin.file:
+        path: "{{ ephemeral_dir }}/cloud-init-{{ item.name }}"
+        state: directory
+        mode: '0755'
+      loop: "{{ molecule_yml.platforms }}"
+
+    - name: Render Cloud-Init user-data, meta-data and network-config
+      ansible.builtin.template:
+        src: "templates/{{ item.1.src }}"
+        dest: "{{ ephemeral_dir }}/cloud-init-{{ item.0.name }}/{{ item.1.dest }}"
+        mode: '0644'
+      vars:
+        ssh_pub_key: "{{ ssh_key_result.public_key }}"
+        platform: "{{ item.0 }}"
+      loop: "{{ molecule_yml.platforms | product([
+        {'src': 'user-data.j2', 'dest': 'user-data'},
+        {'src': 'meta-data.j2', 'dest': 'meta-data'},
+        {'src': 'network-config.j2', 'dest': 'network-config'}
+      ]) | list }}"
+
+    - name: Create Cloud-Init ISO for each VM
+      ansible.builtin.command: >
+        genisoimage -output {{ run_pool_dir }}/{{ item.name }}-{{ molecule_run_id }}-cloud-init.iso
+        -volid cidata -joliet -rock
+        {{ ephemeral_dir }}/cloud-init-{{ item.name }}/user-data
+        {{ ephemeral_dir }}/cloud-init-{{ item.name }}/meta-data
+        {{ ephemeral_dir }}/cloud-init-{{ item.name }}/network-config
+      args:
+        creates: "{{ run_pool_dir }}/{{ item.name }}-{{ molecule_run_id }}-cloud-init.iso"
+      loop: "{{ molecule_yml.platforms }}"
+
+    - name: Ensure permissions on created disk files
+      ansible.builtin.file:
+        path: "{{ run_pool_dir }}/{{ item.name }}-{{ molecule_run_id }}.qcow2"
+        mode: '0666'
+      loop: "{{ molecule_yml.platforms }}"
+
+    - name: Ensure permissions on created ISO files
+      ansible.builtin.file:
+        path: "{{ run_pool_dir }}/{{ item.name }}-{{ molecule_run_id }}-cloud-init.iso"
+        mode: '0666'
+      loop: "{{ molecule_yml.platforms }}"
+
+    - name: Refresh run Storage Pool
+      community.libvirt.virt_pool:
+        uri: "{{ molecule_yml.driver.libvirt_uri }}"
+        name: "{{ run_pool_name }}"
+        command: refresh
+
+    - name: Extract unique network names
+      ansible.builtin.set_fact:
+        all_networks: "{{ (all_networks | default([])) + [item.1.name] }}"
+      loop: "{{ query('subelements', molecule_yml.platforms, 'networks', {'skip_missing': True}) }}"
+      when: item.1.name != 'default'
+
+    - name: Deduplicate network names
+      ansible.builtin.set_fact:
+        all_networks: "{{ all_networks | default([]) | unique }}"
+
+    - name: Create isolated Libvirt networks with static DHCP reservations
+      community.libvirt.virt_net:
+        uri: "{{ molecule_yml.driver.libvirt_uri }}"
+        command: define
+        name: "mol-net-{{ item.1 }}-{{ molecule_run_id }}"
+        xml: |
+          {% set matched_iface = (molecule_yml.platforms | map(attribute='networks') | flatten | selectattr('name', 'equalto', item.1) | map(attribute='interfaces', default=[]) | flatten | selectattr('ip', 'defined') | first) | default({}) %}
+          {% if matched_iface.ip is defined %}
+            {% set net_cidr = matched_iface.ip %}
+            {% set net_addr = net_cidr | ansible.utils.ipaddr('network') %}
+            {% set net_mask = net_cidr | ansible.utils.ipaddr('netmask') %}
+            {% set gateway = net_addr | ansible.utils.ipmath(1) %}
+            {% set range_start = net_addr | ansible.utils.ipmath(10) %}
+            {% set range_end = net_addr | ansible.utils.ipmath(254) %}
+          {% else %}
+            {% set concat_str = molecule_run_id ~ item.1 %}
+            {% set subnet_idx = ((concat_str | hash('md5') | int(base=16)) % 254) + 1 %}
+            {% set net_addr = molecule_yml.driver.base_subnet.split('/')[0] | ansible.utils.ipmath(subnet_idx * 256) %}
+            {% set net_mask = '255.255.255.0' %}
+            {% set gateway = net_addr | ansible.utils.ipmath(1) %}
+            {% set range_start = net_addr | ansible.utils.ipmath(10) %}
+            {% set range_end = net_addr | ansible.utils.ipmath(254) %}
+          {% endif %}
+          <network>
+            <name>mol-net-{{ item.1 }}-{{ molecule_run_id }}</name>
+            <forward mode='nat'/>
+            <ip address='{{ gateway }}' netmask='{{ net_mask }}'>
+              <dhcp>
+                <range start='{{ range_start }}' end='{{ range_end }}'/>
+                {% for platform in molecule_yml.platforms %}
+                  {% for net in platform.networks | default([]) %}
+                    {% if net.name == item.1 and net.interfaces is defined %}
+                      {% for iface in net.interfaces %}
+                        {% if iface.ip is defined %}
+                <host name='{{ platform.name }}-{{ molecule_run_id }}' ip='{{ iface.ip.split('/')[0] }}'/>
+                        {% endif %}
+                      {% endfor %}
+                    {% endif %}
+                  {% endfor %}
+                {% endfor %}
+              </dhcp>
+            </ip>
+          </network>
+      loop: "{{ query('indexed_items', all_networks) }}"
+
+    - name: Ensure custom networks are active
+      community.libvirt.virt_net:
+        uri: "{{ molecule_yml.driver.libvirt_uri }}"
+        name: "mol-net-{{ item }}-{{ molecule_run_id }}"
+        state: active
+      loop: "{{ all_networks }}"
+
+    - name: Define Libvirt VM
+      community.libvirt.virt:
+        uri: "{{ molecule_yml.driver.libvirt_uri }}"
+        command: define
+        xml: "{{ lookup('template', 'templates/vm.xml.j2') }}"
+      loop: "{{ molecule_yml.platforms }}"
+
+    - name: Ensure Libvirt VM is running
+      community.libvirt.virt:
+        uri: "{{ molecule_yml.driver.libvirt_uri }}"
+        name: "{{ item.name }}-{{ molecule_run_id }}"
+        state: running
+      loop: "{{ molecule_yml.platforms }}"
+
+    - name: Retrieve DHCP leases for VMs without static IP
+      community.libvirt.virt_net:
+        uri: "{{ molecule_yml.driver.libvirt_uri }}"
+        name: "mol-net-{{ item.networks[0].name }}-{{ molecule_run_id }}"
+        command: facts
+      register: net_facts
+      until: >
+        (item.networks[0].interfaces is defined and (item.networks[0].interfaces | selectattr('ip', 'defined') | list | length > 0)) or
+        (hostvars['localhost']['ansible_libvirt_networks']['mol-net-' + item.networks[0].name + '-' + molecule_run_id]['dhcp_leases'] | default([]) | length > 0)
+      retries: 30
+      delay: 3
+      loop: "{{ molecule_yml.platforms }}"
+
+    - name: Populate instance config dict
+      ansible.builtin.set_fact:
+        instance_conf_dict:
+          instance: "{{ item.name }}"
+          address: >-
+            {{
+              (
+                item.networks
+                | map(attribute='interfaces', default=[])
+                | flatten
+                | selectattr('primary', 'defined')
+                | selectattr('primary', 'equalto', true)
+                | map(attribute='ip')
+                | map('split', '/')
+                | map('first')
+                | first
+              ) | default(
+                (
+                  item.networks[0].interfaces[0].ip.split('/')[0]
+                  if (item.networks[0].interfaces is defined and item.networks[0].interfaces[0].ip is defined)
+                  else None
+                )
+              ) | default(
+                (
+                  hostvars['localhost']['ansible_libvirt_networks']['mol-net-' + item.networks[0].name + '-' + molecule_run_id]['dhcp_leases']
+                  | selectattr('hostname', 'defined')
+                  | selectattr('hostname', 'equalto', item.name + '-' + molecule_run_id)
+                  | map(attribute='ip')
+                  | first
+                ) | default(
+                  (
+                    hostvars['localhost']['ansible_libvirt_networks']['mol-net-' + item.networks[0].name + '-' + molecule_run_id]['dhcp_leases']
+                    | map(attribute='ip')
+                    | first
+                  )
+                )
+              )
+            }}
+          user: "{{ molecule_yml.driver.vm_username | default('debian') }}"
+          port: 22
+          identity_file: "{{ keypair_path }}"
+      loop: "{{ molecule_yml.platforms }}"
+      register: instance_config_dict
+
+    - name: Convert instance config dict to list
+      ansible.builtin.set_fact:
+        instance_conf: "{{ instance_config_dict.results | map(attribute='ansible_facts.instance_conf_dict') | list }}"
+
+    - name: Dump instance config for Molecule
+      ansible.builtin.copy:
+        content: |
+          # Molecule managed
+
+          {{ instance_conf | to_nice_yaml }}
+        dest: "{{ molecule_instance_config }}"
+        mode: '0600'
+
+    - name: Wait for SSH port to be open on VMs
+      ansible.builtin.wait_for:
+        host: "{{ item.address }}"
+        port: "{{ item.port }}"
+        state: started
+        delay: 5
+        timeout: 120
+      loop: "{{ instance_conf }}"
+
+    - name: Wait for SSH authentication to succeed with generated key
+      ansible.builtin.command: >
+        ssh -i {{ item.identity_file }}
+        -o StrictHostKeyChecking=no
+        -o UserKnownHostsFile=/dev/null
+        -o ConnectTimeout=5
+        {{ item.user }}@{{ item.address }} true
+      register: ssh_check
+      until: ssh_check.rc == 0
+      retries: 30
+      delay: 5
+      loop: "{{ instance_conf }}"
